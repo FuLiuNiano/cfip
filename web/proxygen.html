@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>反代节点生成器</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: "Microsoft YaHei", sans-serif; background:#f4f6f9; margin:0; padding:20px; color:#222; }
+  .wrap { max-width: 860px; margin: 0 auto; }
+  h2 { margin: 8px 0 14px; }
+  label { display:block; font-weight:bold; margin:12px 0 6px; }
+  textarea { width:100%; height:110px; padding:8px; font-size:13px; border:1px solid #bbb; border-radius:6px; resize:vertical; font-family:Consolas,monospace; }
+  .opts { display:flex; gap:16px; align-items:center; margin:14px 0; flex-wrap:wrap; }
+  .opts span { font-weight:bold; }
+  select, input[type=number] { padding:5px 8px; border:1px solid #bbb; border-radius:5px; font-size:13px; }
+  input[type=number] { width:90px; }
+  button { background:#17a2e0; color:#fff; border:0; border-radius:20px; padding:10px 26px; font-size:15px; cursor:pointer; }
+  button:hover { background:#128bc0; }
+  button.mini { background:#5a6268; padding:6px 14px; font-size:12px; border-radius:6px; margin-right:8px; }
+  button.mini:hover { background:#41464b; }
+  #msg { color:#c0392b; margin-left:10px; font-size:13px; }
+  #okmsg { color:#1e8e3e; margin-left:10px; font-size:13px; }
+  .hint { font-size:12px; color:#666; margin-top:4px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h2>反代节点生成器</h2>
+
+  <label>原始节点（每行一条，支持 vmess://、vless://、trojan://）：</label>
+  <textarea id="src" placeholder="vmess://eyJ2IjoiMiIsInBzIjoi5YWl6LSo6IqC55m76K6wIiwiYWRkIjoiZG9tYWluLmNvbSI...</textarea>
+  <div class="hint">CDN 反代原理：连接地址换成优选 IP，Host/SNI 仍用原域名，由 Cloudflare 按域名回源。</div>
+
+  <label>CDN IP 列表（每行一个，支持 ip 或 ip:端口；留空端口则沿用节点端口）：</label>
+  <textarea id="ips" placeholder="104.16.1.1&#10;104.17.2.2:8443&#10;172.67.3.3"></textarea>
+
+  <div class="opts">
+    <span>CDN 提供商：</span>
+    <select id="provider">
+      <option value="custom">自定义</option>
+      <option value="https://addressesapi.090227.xyz/CloudFlareYes">CloudFlareYes 优选</option>
+      <option value="https://ip.164746.xyz/ipTop10.html">ipTop10 优选</option>
+    </select>
+    <span>获取方式：</span>
+    <select id="mode">
+      <option value="seq">顺序</option>
+      <option value="rnd">随机</option>
+    </select>
+    <span>获取节点数：</span>
+    <input type="number" id="count" value="1000" min="1" max="100000">
+    <button onclick="fetchIPs()">拉取优选IP</button>
+  </div>
+
+  <button onclick="gen()">↓点击提取节点↓</button>
+  <span id="msg"></span><span id="okmsg"></span>
+
+  <label>节点列表：</label>
+  <textarea id="out" style="height:220px" readonly></textarea>
+  <div style="margin-top:8px;">
+    <button class="mini" onclick="copyAll()">复制全部</button>
+    <button class="mini" onclick="download()">下载 txt</button>
+    <span class="hint">生成的链接可直接导入 nodesCatch / v2rayN（拖入或剪贴板导入）。</span>
+  </div>
+</div>
+
+<script>
+function $(id){ return document.getElementById(id); }
+function say(t, ok){ $('okmsg').textContent = ok ? t : ''; $('msg').textContent = ok ? '' : t; }
+function b64d(s){
+  s = s.replace(/-/g,'+').replace(/_/g,'/');
+  while (s.length % 4) s += '=';
+  const bin = atob(s);
+  return decodeURIComponent(Array.from(bin).map(c=>'%'+c.charCodeAt(0).toString(16).padStart(2,'0')).join(''));
+}
+function b64e(str){
+  const bin = encodeURIComponent(str).replace(/%([0-9A-F]{2})/g,(m,p)=>String.fromCharCode(parseInt(p,16)));
+  return btoa(bin);
+}
+function q(u,k){ // URLSearchParams 取值
+  const m = u.match(new RegExp('[?&]'+k+'=([^&#]*)'));
+  return m ? decodeURIComponent(m[1]) : '';
+}
+
+/* 解析一条节点 → 统一结构；失败返回 null */
+function parseNode(line){
+  line = line.trim();
+  if (!line) return null;
+  if (line.startsWith('vmess://')){
+    const raw = line.slice(8);
+    let j = null;
+    try { j = JSON.parse(b64d(raw)); } catch(e){}
+    if (j && j.add){ // 标准 JSON 格式
+      return { proto:'vmess', ps:j.ps||j.remarks||'', add:j.add, port:+j.port||443, id:j.id||'',
+               aid:j.aid!==undefined?j.aid:(j.alterId!==undefined?j.alterId:0), scy:j.scy||'auto',
+               net:j.net||'tcp', type:j.type||'none', host:j.host||'', path:j.path||'',
+               tls:j.tls||'', sni:j.sni||j.host||'', alpn:j.alpn||'', fp:j.fp||'' };
+    }
+    // SIP002 风格 vmess://base64(id)@add:port?...
+    const m = raw.match(/^([A-Za-z0-9+/=_-]+)@([\w.\-:]+):(\d+)(\?[^#]*)?(?:#(.*))?$/);
+    if (m){
+      return { proto:'vmess', ps:decodeURIComponent(m[5]||''), add:m[2], port:+m[3], id:b64d(m[1]),
+               aid:0, scy:'auto', net:q(m[4],'type')||'tcp', type:'none', host:q(m[4],'host'),
+               path:q(m[4],'path'), tls:q(m[4],'security'), sni:q(m[4],'sni')||q(m[4],'host'), alpn:'', fp:'' };
+    }
+    return null;
+  }
+  if (line.startsWith('vless://') || line.startsWith('trojan://')){
+    const ci = line.indexOf('://');
+    const proto = line.slice(0, ci);
+    const body = line.slice(ci+3);
+    const m = body.match(/^([^@]+)@([\w.\-:]+):(\d+)(\?[^#]*)?(?:#(.*))?$/);
+    if (!m) return null;
+    const sec = q(m[4],'security');
+    return { proto:proto, ps:decodeURIComponent(m[5]||''), add:m[2], port:+m[3], id:m[1],
+             aid:0, scy:'', net:q(m[4],'type')||'tcp', type:'none', host:q(m[4],'host'),
+             path:q(m[4],'path'), tls:sec, sni:q(m[4],'sni')||q(m[4],'peer')||q(m[4],'host'),
+             alpn:q(m[4],'alpn'), fp:q(m[4],'fp'), flow:q(m[4],'flow') };
+  }
+  return null;
+}
+
+/* 用反代 IP 重建节点链接 */
+function build(n, ip, port, name){
+  if (n.proto === 'vmess'){
+    const j = { v:'2', ps:name, add:ip, port:String(port), id:n.id, aid:String(n.aid||0),
+                scy:n.scy||'auto', net:n.net, type:n.type||'none', host:n.host, path:n.path,
+                tls:n.tls||'', sni:n.sni||n.host, alpn:n.alpn||'', fp:n.fp||'' };
+    return 'vmess://' + b64e(JSON.stringify(j));
+  }
+  let p = { type:n.net, host:n.host, sni:n.sni, fp:n.fp, alpn:n.alpn };
+  if (n.path) p.path = n.path;
+  if (n.proto === 'vless' && n.flow) p.flow = n.flow;
+  if (n.proto === 'trojan') p.sni = p.sni || n.host;
+  if (n.tls) p.security = n.tls;
+  else if (n.proto === 'trojan') p.security = 'tls';
+  const qs = Object.entries(p).filter(([k,v])=>v!=='' && v!==undefined)
+    .map(([k,v])=>k+'='+encodeURIComponent(v)).join('&');
+  const tag = encodeURIComponent(name);
+  return n.proto + '://' + n.id + '@' + ip + ':' + port + (qs?'?'+qs:'') + '#' + tag;
+}
+
+async function fetchIPs(){
+  const url = $('provider').value;
+  if (url === 'custom'){ say('请直接在下框粘贴自定义 IP 列表', true); return; }
+  say('正在拉取优选IP...');
+  try {
+    const r = await fetch(url);
+    const t = await r.text();
+    const ips = t.split(/\s+/).filter(x=>/^[\d.]+(:\d+)?$/.test(x));
+    if (!ips.length) throw 0;
+    $('ips').value = ips.join('\n');
+    say('已拉取 '+ips.length+' 个IP', true);
+  } catch(e){ say('该源拉取失败（多为跨域限制），请手动粘贴 IP 列表'); }
+}
+
+function gen(){
+  say('');
+  const nodes = $('src').value.split('\n').map(parseNode).filter(Boolean);
+  if (!nodes.length){ say('原始节点解析失败：请检查是否为完整的 vmess/vless/trojan 链接'); return; }
+  let ips = $('ips').value.split('\n').map(x=>x.trim()).filter(x=>/^[\w.\-:]+$/.test(x));
+  if (!ips.length){ say('请填写 CDN IP 列表'); return; }
+  const want = +$('count').value || 1000;
+  if ($('mode').value === 'rnd') ips = ips.slice().sort(()=>Math.random()-0.5);
+
+  const out = [];
+  outer:
+  for (const n of nodes){
+    let i = 0;
+    for (const entry of ips){
+      const [ip, p2] = entry.split(':');
+      const port = p2 ? +p2 : n.port;
+      out.push(build(n, ip, port, n.ps + '-' + String(++i).padStart(3,'0')));
+      if (out.length >= want) break outer;
+    }
+  }
+  $('out').value = out.join('\n');
+  say('已生成 '+out.length+' 个节点', true);
+}
+
+function copyAll(){
+  if (!$('out').value){ say('还没有生成结果'); return; }
+  navigator.clipboard.writeText($('out').value)
+    .then(()=>say('已复制到剪贴板', true))
+    .catch(()=>{ $('out').select(); document.execCommand('copy'); say('已复制', true); });
+}
+function download(){
+  if (!$('out').value){ say('还没有生成结果'); return; }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([$('out').value], {type:'text/plain'}));
+  a.download = '反代节点.txt';
+  a.click();
+}
+</script>
+</body>
+</html>
